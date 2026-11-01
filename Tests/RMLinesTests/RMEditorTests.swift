@@ -142,6 +142,21 @@ struct RMEditorTests {
         #expect(highlight.id == SceneItemID(author: 1, counter: 20))
     }
 
+    // A deleted length removes a highlight even with a value behind it, the
+    // way the editor reads it: the page does not show what the editor cannot
+    // erase, and the removal is no loss.
+    @Test("A deleted highlight with a value is not shown and not listed")
+    func deletedHighlightWithValueIsNotShown() throws {
+        let rectangles: [UInt8] = [0x6C, 33, 0, 0, 0, 1] + [UInt8](repeating: 0, count: 32)
+        let value: [UInt8] = [0x01, 0x44, 3, 0, 0, 0] + rectangles
+        let glyph = preamble(item: 20, deleted: 1) + [0x6C] + le32(value.count) + value
+        let data = page(block(type: 0x03, versions: (1, 1), glyph))
+        let parsed = try RMParser.parsePage(data)
+        #expect(parsed.highlights.isEmpty)
+        #expect(parsed.skippedBlocks == 0)
+        #expect(try RMEditor.highlighterItems(in: data).isEmpty)
+    }
+
     @Test("A highlight whose rectangles run past its value is a counted loss")
     func highlightRectanglesStayInsideTheValue() throws {
         // Two rectangles declared, room for one.

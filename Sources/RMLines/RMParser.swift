@@ -622,6 +622,11 @@ public enum RMParser {
             }
             return nil
         }
+        // A deleted length removes the highlight whatever follows it, as it
+        // removes a stroke from the scene: the editor and the scene walk read
+        // it so, and a highlight the page shows has to be one the editor can
+        // erase.
+        guard preamble.deleted == 0 else { return nil }
         // The value declares its length, and it is held to the block: what
         // follows is read inside the value and nowhere else. Its type is
         // not checked — the tablet writes `0x01`, but a highlight refused
