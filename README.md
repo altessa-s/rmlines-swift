@@ -7,6 +7,10 @@ A standalone Swift package with no dependencies at all. Consumers link either th
 other platforms there is **[rmlines-lib](https://github.com/altessa-s/rmlines-lib)**, the same format as a portable C23 library: the two read the
 same pages to the same strokes, text and styles, and write the same draft to the same bytes.
 
+Part of **[Slate Drive](https://slatedrive.app)** ([repository](https://github.com/altessa-s/slatedrive)), the macOS app that shows a reMarkable
+library in Finder. Its sibling **[rmdoc-swift](https://github.com/altessa-s/rmdoc-swift)** packs and unpacks the `.rmdoc` container these pages
+travel in.
+
 ## Why it exists
 
 A notebook on disk is a CRDT of tagged blocks, not a picture. Turning one into the other is two jobs: **read the file**, then **draw what was read**.
@@ -288,8 +292,18 @@ tests that own them belong with whatever does the drawing.
 ## See also
 
 - **[rmlines-lib](https://github.com/altessa-s/rmlines-lib)** — the same format as a portable C23 library, with a `rmdump` tool.
+- **[rmdoc-swift](https://github.com/altessa-s/rmdoc-swift)** — the `.rmdoc` container a document and its pages are exported and imported in.
+- **[Slate Drive](https://slatedrive.app)** ([repository](https://github.com/altessa-s/slatedrive)) — the app these packages are part of.
+
+## Acknowledgements
+
+The `.rm` format is not published by reMarkable. This package is built on openly available information and on the research of third-party
+developers who documented the format, among them [rmscene](https://github.com/ricklupton/rmscene) and
+[remarkable_rust](https://github.com/hiteshjoshi/remarkable_rust).
 
 ## Licence
 
 MIT — see [LICENSE](LICENSE). The sample corpus under `Tests/RMLinesTests/Fixtures/v6-samples/` comes from
 [remarkable_rust](https://github.com/hiteshjoshi/remarkable_rust) and carries its own licence beside it.
+
+reMarkable is a trademark of reMarkable AS. This project is not affiliated with, endorsed by or sponsored by reMarkable AS.
