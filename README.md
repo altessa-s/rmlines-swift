@@ -186,7 +186,7 @@ Two levels, not five: a piece of the page was lost (`error`), or the format held
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/altessa-s/rmlines-swift.git", from: "0.14.1"),
+    .package(url: "https://github.com/altessa-s/rmlines-swift.git", from: "1.0.0"),
 ],
 targets: [
     .target(
