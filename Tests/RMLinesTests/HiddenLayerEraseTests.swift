@@ -72,6 +72,37 @@ private func removal(of node: WriterID) -> [UInt8] {
     return writerBlock(1, record.bytes)
 }
 
+/// A node put back into the tree under `parent`: a fresh record whose tag 2
+/// names the node, as the tablet writes when it moves typed text and the
+/// handwriting anchored to it.
+private func reinsertion(of node: WriterID, under parent: WriterID) -> [UInt8] {
+    var record = RMBinaryWriter()
+    record.appendID(index: 1, (1, 96))
+    record.appendID(index: 2, node)
+    record.appendTag(index: 3, type: 1)
+    record.append(1)
+    var place = RMBinaryWriter()
+    place.appendID(index: 1, parent)
+    record.appendBlock(index: 4, place.bytes)
+    return writerBlock(1, record.bytes)
+}
+
+/// A group item under `parent` that names `child`.
+private func link(_ child: WriterID, under parent: WriterID, item: WriterID) -> [UInt8] {
+    var group = RMBinaryWriter()
+    group.appendID(index: 1, parent)
+    group.appendID(index: 2, item)
+    group.appendID(index: 3, (0, 0))
+    group.appendID(index: 4, (0, 0))
+    group.appendTag(index: 5, type: 4)
+    group.append(uint32: 0)
+    var value = RMBinaryWriter()
+    value.append(2)
+    value.appendID(index: 2, child)
+    group.appendBlock(index: 6, value.bytes)
+    return writerBlock(4, group.bytes)
+}
+
 private func page(_ blocks: [UInt8]...) -> Data {
     Data(Array(RMParser.header.utf8) + blocks.joined())
 }
@@ -134,6 +165,84 @@ struct HiddenLayerEraseTests {
             stroke((1, 31), parent: hidden, tool: .highlighter2)
         )
         #expect(try RMEditor.highlighterItems(in: data).isEmpty)
+    }
+
+    @Test("A layer taken out and put back is drawn and searched again")
+    func drawsAReinsertedLayer() throws {
+        let data = page(
+            layer(hidden, hidden: false, link: (1, 22)),
+            removal(of: hidden),
+            reinsertion(of: hidden, under: (0, 1)),
+            stroke((1, 31), parent: hidden, tool: .highlighter2)
+        )
+        let drawn = try RMParser.parsePage(data)
+        #expect(drawn.strokes.map(\.id) == [SceneItemID(author: 1, counter: 31)])
+        #expect(drawn.skippedBlocks == 0)
+        #expect(try RMEditor.highlighterItems(in: data) == [SceneItemID(author: 1, counter: 31)])
+    }
+
+    @Test("A group moved under a layer later removed goes with that layer")
+    func dropsAGroupMovedUnderARemovedLayer() throws {
+        let group: WriterID = (1, 41)
+        let data = page(
+            layer(shown, hidden: false, link: (1, 12)),
+            layer(hidden, hidden: false, link: (1, 22)),
+            link(group, under: shown, item: (1, 42)),
+            reinsertion(of: group, under: hidden),
+            removal(of: hidden),
+            stroke((1, 31), parent: group, tool: .highlighter2)
+        )
+        #expect(try RMParser.parsePage(data).strokes.isEmpty)
+        #expect(try RMEditor.highlighterItems(in: data).isEmpty)
+    }
+
+    @Test("A group moved out of a layer later removed stays")
+    func keepsAGroupMovedOutOfARemovedLayer() throws {
+        let group: WriterID = (1, 41)
+        let data = page(
+            layer(shown, hidden: false, link: (1, 12)),
+            layer(hidden, hidden: false, link: (1, 22)),
+            link(group, under: hidden, item: (1, 42)),
+            reinsertion(of: group, under: shown),
+            removal(of: hidden),
+            stroke((1, 31), parent: group, tool: .highlighter2)
+        )
+        #expect(try RMParser.parsePage(data).strokes.map(\.id) == [SceneItemID(author: 1, counter: 31)])
+        #expect(try RMEditor.highlighterItems(in: data) == [SceneItemID(author: 1, counter: 31)])
+    }
+
+    @Test("A group moved and linked under its new layer is drawn there, once")
+    func drawsAMovedGroupFromItsNewLayer() throws {
+        let group: WriterID = (1, 41)
+        let data = page(
+            layer(shown, hidden: false, link: (1, 12)),
+            layer(hidden, hidden: true, link: (1, 22)),
+            link(group, under: hidden, item: (1, 42)),
+            link(group, under: shown, item: (1, 43)),
+            reinsertion(of: group, under: shown),
+            stroke((1, 31), parent: group, tool: .fineliner2)
+        )
+        // Under the shown layer now: the stale link into the hidden one
+        // neither hides it nor draws it a second time.
+        #expect(try RMParser.parsePage(data).strokes.map(\.id) == [SceneItemID(author: 1, counter: 31)])
+    }
+
+    @Test("A tree record whose parent runs past its block does not read")
+    func refusesATruncatedTreeParent() throws {
+        var record = RMBinaryWriter()
+        record.appendID(index: 1, (1, 96))
+        record.appendID(index: 2, hidden)
+        record.appendTag(index: 3, type: 1)
+        record.append(1)
+        record.appendTag(index: 4, type: 0xC)
+        let data = page(
+            layer(hidden, hidden: false, link: (1, 22)),
+            writerBlock(1, record.bytes),
+            stroke((1, 31), parent: hidden, tool: .fineliner2)
+        )
+        let drawn = try RMParser.parsePage(data)
+        #expect(drawn.skippedBlocks == 1)
+        #expect(drawn.strokes.map(\.id) == [SceneItemID(author: 1, counter: 31)])
     }
 
     @Test("A group nested in a removed layer is as gone as the layer")

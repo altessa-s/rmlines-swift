@@ -197,7 +197,11 @@ public enum RMParser {
                 // Which nodes are in the tree. The one authority on the list
                 // of layers: a deleted layer keeps its `0x02` and its `0x04`,
                 // and only this block says it is gone.
-                if let event = try? parseSceneTree(&reader) { treeEvents.append(event) } else { otherBlocks += 1 }
+                if let event = try? parseSceneTree(&reader, end: blockEnd) {
+                    treeEvents.append(event)
+                } else {
+                    otherBlocks += 1
+                }
 
             case sceneGroupItemBlock:
                 // The link of a child group into its parent's list of items —
@@ -787,18 +791,106 @@ public enum RMParser {
     struct TreeEvent {
         let node: CrdtID
         let inTree: Bool
+        /// Where the record puts the node (tag 4) — read only for a node
+        /// going in; `nil` when the record names no parent.
+        let parent: CrdtID?
     }
 
-    /// A record of the scene tree. An adding record names its node in tag 1
-    /// with tag 2 at nought; a removing one is a fresh record whose tag 2
-    /// names the node taken out (`inTree=0` is a real removal — the device's
-    /// five-layer limit counts by these).
-    private static func parseSceneTree(_ reader: inout RMBinaryReader) throws -> TreeEvent {
+    /// The scene tree as its records leave it, applied in file order: the
+    /// nodes taken out, and the parent each node in the tree was last put
+    /// under.
+    struct TreeState {
+        var removed: Set<CrdtID> = []
+        var parentOf: [CrdtID: CrdtID] = [:]
+
+        init(_ events: [TreeEvent]) {
+            for event in events {
+                if event.inTree {
+                    removed.remove(event.node)
+                    if let parent = event.parent { parentOf[event.node] = parent }
+                } else {
+                    removed.insert(event.node)
+                }
+            }
+        }
+
+        /// Whether a group item under `parent` that names `child` is where
+        /// the child is now. A node moved to another parent keeps its old
+        /// group item until the tablet tombstones it; the tree record is
+        /// the newer word on where the node lives. A node no record places
+        /// is taken where its group item puts it.
+        func links(_ parent: CrdtID, to child: CrdtID) -> Bool {
+            parentOf[child].map { $0 == parent } ?? true
+        }
+
+        /// Whether `node` or a node above it, as the tree records place
+        /// them, is in `gone`. The answer for every node the climb passes is
+        /// written into `cache`, so a caller asking this once per item of a
+        /// page, sharing one `cache` across every ask, climbs each edge of
+        /// the tree once in all rather than once per item hanging under it —
+        /// the difference between linear and quadratic on a page many items
+        /// hang under one deep chain of layers. A cycle in the records still
+        /// ends the climb: a node seen twice in one climb has, by this path,
+        /// reached no node of `gone`, and is cached `false` with the rest of
+        /// the path behind it.
+        func isUnder(_ gone: Set<CrdtID>, _ node: CrdtID, cache: inout [CrdtID: Bool]) -> Bool {
+            var path: [CrdtID] = []
+            var seen: Set<CrdtID> = []
+            var current: CrdtID? = node
+            var answer = false
+            while let at = current {
+                if let cached = cache[at] {
+                    answer = cached
+                    break
+                }
+                guard seen.insert(at).inserted else { break }
+                if gone.contains(at) {
+                    path.append(at)
+                    answer = true
+                    break
+                }
+                path.append(at)
+                current = parentOf[at]
+            }
+            for visited in path { cache[visited] = answer }
+            return answer
+        }
+    }
+
+    /// A record of the scene tree. The record that creates a node names it in
+    /// tag 1 with tag 2 at nought; every later record is a fresh one whose
+    /// tag 2 names the node it moves — out of the tree (`inTree=0`, a real
+    /// removal: the device's five-layer limit counts by these) or back in.
+    /// The tablet does the second when typed text is moved: the handwriting
+    /// anchored to it is taken out and put back, and a put-back read by its
+    /// record's identifier would leave the node removed. A record that puts
+    /// a node in names its parent in tag 4, and that parent can be another
+    /// than the one before. Everything is read inside the block: a parent
+    /// that does not fit is a block that does not read, not a parent taken
+    /// from the next block's bytes.
+    private static func parseSceneTree(_ reader: inout RMBinaryReader, end: Int) throws -> TreeEvent {
         let record = try reader.readCrdtID(index: 1)
         let target = try reader.readCrdtID(index: 2)
         try reader.expectTag(index: 3, type: .byte1)
         let inTree = try reader.readUInt8() != 0
-        return TreeEvent(node: inTree ? record : target, inTree: inTree)
+        guard reader.offset <= end else { throw ParseError.malformedPage("a tree record runs past its block") }
+        let names = target.author != 0 || target.counter != 0
+        var parent: CrdtID?
+        if inTree, reader.offset < end, reader.matchTag(index: 4, type: .length4) {
+            guard reader.offset + 4 <= end else {
+                throw ParseError.malformedPage("a tree record's parent runs past its block")
+            }
+            let length = Int(try reader.readUInt32())
+            let subEnd = reader.offset + length
+            guard subEnd <= end else {
+                throw ParseError.malformedPage("a tree record's parent runs past its block")
+            }
+            parent = try reader.readCrdtID(index: 1)
+            guard reader.offset <= subEnd else {
+                throw ParseError.malformedPage("a tree record's parent runs past its field")
+            }
+        }
+        return TreeEvent(node: names ? target : record, inTree: inTree, parent: parent)
     }
 
     /// A group's place in its parent's list (`0x04`): the same preamble as a
@@ -884,11 +976,11 @@ public enum RMParser {
     ) {
         // The nodes taken out of the tree, by applying the records in order.
         // Only an explicit removal counts: a node nobody added is not dropped,
-        // or a file without tree records would draw nothing.
-        var removed: Set<CrdtID> = []
-        for event in events {
-            if event.inTree { removed.remove(event.node) } else { removed.insert(event.node) }
-        }
+        // or a file without tree records would draw nothing. A group item
+        // that names a node the records have since put elsewhere is a stale
+        // link: the node is reached from where it is now, or not at all.
+        let tree = TreeState(events)
+        let removed = tree.removed
 
         let childrenOfNode = Dictionary(grouping: items.indices) { items[$0].parent }
         // The roots: nodes that hold items but are named by no group item —
@@ -902,12 +994,15 @@ public enum RMParser {
         var images: [PlacedImageItem] = []
         var placed = Set<Int>()
         // A subtree that is not drawn, and whose items are nonetheless spoken
-        // for: the fallback below must not resurrect a hidden layer.
+        // for: the fallback below must not resurrect a hidden layer. A node
+        // moved out of it is not part of it any more and is left to be
+        // reached from where it is now.
         func claimSubtree(of node: CrdtID) {
             var stack = childrenOfNode[node] ?? []
             while let index = stack.popLast() {
                 guard placed.insert(index).inserted else { continue }
-                if case .group(let child) = items[index].content {
+                if case .group(let child) = items[index].content,
+                   tree.links(items[index].parent, to: child) {
                     stack.append(contentsOf: childrenOfNode[child] ?? [])
                 }
             }
@@ -940,6 +1035,9 @@ public enum RMParser {
                     case .stroke(let stroke):
                         result.append((stroke, frame.node))
                     case .group(let child):
+                        // A stale link: the child is drawn, if at all, from
+                        // its present parent.
+                        guard tree.links(frame.node, to: child) else { continue }
                         guard !removed.contains(child), !hidden.contains(child) else {
                             claimSubtree(of: child)
                             continue
@@ -974,11 +1072,16 @@ public enum RMParser {
             walk(from: root)
         }
 
-        // Whatever the walk never reached — in file order.
+        // Whatever the walk never reached — in file order. A node the records
+        // moved under a removed or hidden one goes with it here too.
+        let gone = removed.union(hidden)
+        // Shared across every ask below, so the chain above a parent many
+        // unplaced items share is climbed once rather than once per item.
+        var underGoneCache: [CrdtID: Bool] = [:]
         for index in items.indices where !placed.contains(index) {
             guard items[index].deleted == 0 else { continue }
             let parent = items[index].parent
-            guard !removed.contains(parent), !hidden.contains(parent) else { continue }
+            guard !tree.isUnder(gone, parent, cache: &underGoneCache) else { continue }
             switch items[index].content {
             case .stroke(let stroke):
                 result.append((stroke, parent))
