@@ -197,7 +197,11 @@ public enum RMParser {
                 // Which nodes are in the tree. The one authority on the list
                 // of layers: a deleted layer keeps its `0x02` and its `0x04`,
                 // and only this block says it is gone.
-                if let event = try? parseSceneTree(&reader, end: blockEnd) { treeEvents.append(event) } else { otherBlocks += 1 }
+                if let event = try? parseSceneTree(&reader, end: blockEnd) {
+                    treeEvents.append(event)
+                } else {
+                    otherBlocks += 1
+                }
 
             case sceneGroupItemBlock:
                 // The link of a child group into its parent's list of items —
@@ -820,16 +824,36 @@ public enum RMParser {
         }
 
         /// Whether `node` or a node above it, as the tree records place
-        /// them, is in `gone`. Each node is looked at once, so a cycle in
-        /// the records ends the climb.
-        func isUnder(_ gone: Set<CrdtID>, _ node: CrdtID) -> Bool {
+        /// them, is in `gone`. The answer for every node the climb passes is
+        /// written into `cache`, so a caller asking this once per item of a
+        /// page, sharing one `cache` across every ask, climbs each edge of
+        /// the tree once in all rather than once per item hanging under it —
+        /// the difference between linear and quadratic on a page many items
+        /// hang under one deep chain of layers. A cycle in the records still
+        /// ends the climb: a node seen twice in one climb has, by this path,
+        /// reached no node of `gone`, and is cached `false` with the rest of
+        /// the path behind it.
+        func isUnder(_ gone: Set<CrdtID>, _ node: CrdtID, cache: inout [CrdtID: Bool]) -> Bool {
+            var path: [CrdtID] = []
             var seen: Set<CrdtID> = []
             var current: CrdtID? = node
-            while let at = current, seen.insert(at).inserted {
-                if gone.contains(at) { return true }
+            var answer = false
+            while let at = current {
+                if let cached = cache[at] {
+                    answer = cached
+                    break
+                }
+                guard seen.insert(at).inserted else { break }
+                if gone.contains(at) {
+                    path.append(at)
+                    answer = true
+                    break
+                }
+                path.append(at)
                 current = parentOf[at]
             }
-            return false
+            for visited in path { cache[visited] = answer }
+            return answer
         }
     }
 
@@ -1051,10 +1075,13 @@ public enum RMParser {
         // Whatever the walk never reached — in file order. A node the records
         // moved under a removed or hidden one goes with it here too.
         let gone = removed.union(hidden)
+        // Shared across every ask below, so the chain above a parent many
+        // unplaced items share is climbed once rather than once per item.
+        var underGoneCache: [CrdtID: Bool] = [:]
         for index in items.indices where !placed.contains(index) {
             guard items[index].deleted == 0 else { continue }
             let parent = items[index].parent
-            guard !tree.isUnder(gone, parent) else { continue }
+            guard !tree.isUnder(gone, parent, cache: &underGoneCache) else { continue }
             switch items[index].content {
             case .stroke(let stroke):
                 result.append((stroke, parent))

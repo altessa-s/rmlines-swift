@@ -278,3 +278,142 @@ func aTiedPageDoesNotHang() throws {
         "\(records) tied records took \(elapsed)s — the ordering walk has gone quadratic"
     )
 }
+
+// A page hostile through a different door: a chain of layers thousands deep,
+// with many strokes hanging unplaced under the deepest one — a group item
+// links the layer in, but with a parent that disagrees with the tree
+// record, so the walk leaves the whole of it for the fallback that asks
+// "is this under a removed or hidden node" to find. Climbing the chain anew
+// for every one of those strokes is quadratic in the chain's depth times
+// their count, and the file chooses both.
+
+/// A `0x01` record: `node` entering the tree under `parent` — `nil` names
+/// none, so a climb that reaches it finds nothing further up — or, `inTree`
+/// false, `node` taken out. The record names no target of its own (tag 2 at
+/// nought), so the node it is about is the one in tag 1.
+private func treeRecord(_ node: WriterID, inTree: Bool, under parent: WriterID? = nil) -> [UInt8] {
+    var body = RMBinaryWriter()
+    body.appendID(index: 1, node)
+    body.appendID(index: 2, (0, 0))
+    body.appendTag(index: 3, type: 1)
+    body.append(inTree ? 1 : 0)
+    if inTree, let parent {
+        var sub = RMBinaryWriter()
+        sub.appendID(index: 1, parent)
+        body.appendBlock(index: 4, sub.bytes)
+    }
+    return writerBlock(1, body.bytes)
+}
+
+/// `depth` tree records, each placing node `k` under node `k - 1`; the
+/// first names no parent. The records, the top node and the deepest one.
+private func treeChain(depth: Int) -> (records: [UInt8], top: WriterID, deepest: WriterID) {
+    var bytes: [UInt8] = []
+    var parent: WriterID?
+    var node: WriterID = (2, 0)
+    for k in 0..<depth {
+        node = (2, UInt64(k))
+        bytes += treeRecord(node, inTree: true, under: parent)
+        parent = node
+    }
+    return (bytes, (2, 0), node)
+}
+
+/// A group item linking `child` under the page root — but the tree record
+/// already said `child`'s parent is something else, so `tree.links` finds
+/// the two addresses disagree. The walk takes that for a stale link and
+/// leaves `child`'s subtree alone rather than claiming it, so its items
+/// reach the fallback below unplaced — which is the door this file means to
+/// test, not the ordinary one a sound group item opens.
+private func staleLink(child: WriterID, id: WriterID) -> [UInt8] {
+    var body = RMBinaryWriter()
+    body.appendID(index: 1, (0, 1))
+    body.appendID(index: 2, id)
+    body.appendID(index: 3, (0, 0))
+    body.appendID(index: 4, (0, 0))
+    body.appendTag(index: 5, type: 4)
+    body.append(uint32: 0)
+    var value = RMBinaryWriter()
+    value.append(2)
+    value.appendID(index: 2, child)
+    body.appendBlock(index: 6, value.bytes)
+    return writerBlock(4, body.bytes)
+}
+
+/// A minimal `0x05` stroke under `parent`, with no points — a valid stroke
+/// of nothing, all a test about where an item ends up rather than what it
+/// is drawn with needs.
+private func minimalStroke(_ id: WriterID, parent: WriterID) -> [UInt8] {
+    var value = RMBinaryWriter()
+    value.append(0x03)
+    value.appendTag(index: 1, type: 0x4)
+    value.append(uint32: UInt32(PenTool.fineliner2.rawValue))
+    value.appendTag(index: 2, type: 0x4)
+    value.append(uint32: 0)
+    value.appendTag(index: 3, type: 0x8)
+    value.append(double: 1)
+    value.appendTag(index: 4, type: 0x4)
+    value.append(float: 0)
+    value.appendBlock(index: 5, [])
+    var line = RMBinaryWriter()
+    line.appendID(index: 1, parent)
+    line.appendID(index: 2, id)
+    line.appendID(index: 3, (0, 0))
+    line.appendID(index: 4, (0, 0))
+    line.appendTag(index: 5, type: 0x4)
+    line.append(uint32: 0)
+    line.appendBlock(index: 6, value.bytes)
+    return writerBlock(5, minVersion: 2, currentVersion: 2, line.bytes)
+}
+
+@Test("Many strokes under one deep chain of layers are read in time proportional to their count")
+func deepChainWithManyUnplacedStrokesDoesNotHang() throws {
+    let depth = 8_000
+    let strokeCount = 8_000
+    let chain = treeChain(depth: depth)
+    var bytes = Array(RMParser.header.utf8)
+    bytes += chain.records
+    bytes += staleLink(child: chain.deepest, id: (8, 1))
+    for k in 0..<strokeCount {
+        bytes += minimalStroke((3, UInt64(k)), parent: chain.deepest)
+    }
+
+    let started = Date()
+    let page = try RMParser.parsePage(Data(bytes))
+    let elapsed = Date().timeIntervalSince(started)
+
+    #expect(page.strokes.count == strokeCount)
+    // Generous on purpose, as above: the deadline catches a fallback that
+    // climbs the chain anew for every stroke, not a slow machine.
+    #expect(
+        elapsed < 5,
+        "\(strokeCount) strokes under a chain \(depth) deep took \(elapsed)s — isUnder has gone quadratic"
+    )
+}
+
+@Test("Items under a chain whose top is removed are not drawn")
+func itemsUnderARemovedChainTopAreNotDrawn() throws {
+    let chain = treeChain(depth: 5)
+    var bytes = Array(RMParser.header.utf8)
+    bytes += chain.records
+    bytes += treeRecord(chain.top, inTree: false)
+    bytes += staleLink(child: chain.deepest, id: (8, 1))
+    bytes += minimalStroke((3, 0), parent: chain.deepest)
+
+    let page = try RMParser.parsePage(Data(bytes))
+    #expect(page.strokes.isEmpty, "the chain's top is gone, and everything under it goes with it")
+}
+
+@Test("Items under a chain with a cycle and no removed node are drawn")
+func itemsUnderACyclicChainAreDrawn() throws {
+    let a: WriterID = (2, 0)
+    let b: WriterID = (2, 1)
+    var bytes = Array(RMParser.header.utf8)
+    bytes += treeRecord(a, inTree: true, under: b)
+    bytes += treeRecord(b, inTree: true, under: a)
+    bytes += staleLink(child: a, id: (8, 1))
+    bytes += minimalStroke((3, 0), parent: a)
+
+    let page = try RMParser.parsePage(Data(bytes))
+    #expect(page.strokes.count == 1, "the cycle reaches no removed or hidden node, so the stroke stands")
+}
