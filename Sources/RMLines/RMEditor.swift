@@ -112,17 +112,21 @@ public enum RMEditor {
         let blocks = try RMParser.readBlocks(page)
         let lost = blocks.unreadableStrokes + blocks.otherBlocks
         guard lost == 0 else { throw EditError.incompletePage(lost) }
-        var removed: Set<CrdtID> = []
-        for event in blocks.treeEvents {
-            if event.inTree { removed.remove(event.node) } else { removed.insert(event.node) }
-        }
+        let tree = RMParser.TreeState(blocks.treeEvents)
+        var removed = tree.removed
         // Everything under a removed node goes with it: a group nested in a
         // removed layer is as gone as the layer. Walked with a queue of its
         // own, and each node once, so a cycle in the links ends the walk.
-        let childrenOf = Dictionary(grouping: blocks.items.compactMap { item -> (CrdtID, CrdtID)? in
-            guard item.deleted == 0, case .group(let child) = item.content else { return nil }
+        // A node is under the parent the tree records last put it under:
+        // a group item left behind by a move links nothing, and a node
+        // moved without a group item of its own is still under its parent.
+        let groupLinks = blocks.items.compactMap { item -> (CrdtID, CrdtID)? in
+            guard item.deleted == 0, case .group(let child) = item.content,
+                  tree.links(item.parent, to: child) else { return nil }
             return (item.parent, child)
-        }, by: \.0)
+        }
+        let recordLinks = tree.parentOf.map { child, parent in (parent, child) }
+        let childrenOf = Dictionary(grouping: groupLinks + recordLinks, by: \.0)
         var queue = Array(removed)
         while let node = queue.popLast() {
             for (_, child) in childrenOf[node] ?? [] where removed.insert(child).inserted {
